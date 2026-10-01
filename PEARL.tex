@@ -1,0 +1,633 @@
+% Compile from the repository root with `make pearl`.
+% Editorial guidance: Richard Bird, How to Write a Functional Pearl (ICFP 2006),
+% https://static.cambridge.org/content/id/urn:cambridge.org:id:article:S0956796809990256/resource/name/S0956796809990256sup001.pdf
+% and Jeremy Gibbons, Functional Pearls: Editorial (JFP 2010),
+% https://doi.org/10.1017/S0956796809990256
+\documentclass[11pt]{article}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[letterpaper,textwidth=146mm,textheight=220mm,centering]{geometry}
+\usepackage{amsmath,amsthm}
+\usepackage{newpxtext,newpxmath}
+\usepackage[scaled=0.96]{inconsolata}
+\usepackage{microtype}
+\usepackage{listings,upquote}
+\usepackage{xcolor}
+\usepackage[round,authoryear]{natbib}
+\usepackage{needspace}
+\usepackage{fancyhdr}
+\usepackage{hyperref}
+
+\definecolor{linkink}{rgb}{0.08,0.16,0.24}
+\hypersetup{colorlinks=true,allcolors=linkink,
+  pdftitle={From nothing to a modal editor},
+  pdfsubject={A functional pearl in Lean 4},pdfauthor={}}
+\urlstyle{same}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\itshape From nothing to a modal editor}
+\fancyhead[R]{\small\thepage}
+\renewcommand{\headrulewidth}{0pt}
+\setlength{\headheight}{14pt}
+\fancypagestyle{plain}{\fancyhf{}\fancyfoot[C]{\small\thepage}}
+\setlength{\parindent}{1em}
+\setlength{\parskip}{0pt}
+\setlength{\emergencystretch}{1em}
+\clubpenalty=10000
+\widowpenalty=10000
+\displaywidowpenalty=10000
+\raggedbottom
+
+\lstdefinelanguage{Lean}{
+  morekeywords={def,inductive,structure,where,deriving,theorem,by,fun,match,with,
+    if,then,else,let,in,do,pure,return,namespace,end,import},
+  morekeywords=[2]{rfl,simp,rw,cases,induction,generalizing},
+  sensitive=true,
+  morecomment=[l]{--},morecomment=[s]{/-}{-/},morestring=[b]",
+  literate={→}{{$\to$}}1 {←}{{$\leftarrow$}}1
+    {⟨}{{$\langle$}}1 {⟩}{{$\rangle$}}1 {≤}{{$\leq$}}1
+    {≠}{{$\neq$}}1 {∉}{{$\notin$}}1 {·}{{$\cdot$}}1
+    {∘}{{$\circ$}}1}
+\lstset{basicstyle=\fontsize{9.5}{11.5}\selectfont\ttfamily,
+  keywordstyle=\bfseries,keywordstyle=[2]\mdseries,
+  commentstyle=\color{gray},columns=fullflexible,keepspaces=true,
+  showstringspaces=false,upquote=true,aboveskip=8pt,belowskip=8pt,
+  xleftmargin=1em,breaklines=false,tabsize=2}
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\cat}{\mathbin{+\!+}}
+\newcommand{\rev}{\operatorname{rev}}
+\newcommand{\take}{\operatorname{take}}
+\newcommand{\drop}{\operatorname{drop}}
+\newcommand{\txt}{\mathsf{T}}
+\newcommand{\pos}{\mathsf{P}}
+\newcommand{\ins}{\mathbin{\triangleleft}}
+\newcommand{\cmd}{\mathsf{command}}
+\newcommand{\insertmode}{\mathsf{insert}}
+\newcommand{\chars}{\mathsf{chars}}
+\newcommand{\esc}{\mathsf{esc}}
+\newcommand{\ikey}{\mathsf{i}}
+\newcommand{\Replay}{\mathsf{R}}
+\newcommand{\Direct}{\mathsf{D}}
+\newcommand{\Session}{\mathsf{S}}
+\newtheorem{law}{Law}
+
+\title{From nothing to a modal editor}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-3.5em}
+\begin{abstract}
+We grow a small terminal editor from a program that does nothing, then give it
+insert and command modes. The construction follows one equation: inserting two
+lists in succession is insertion of their concatenation. A zipper makes this
+law easy to prove; a keyboard interpretation turns it into a law about typing;
+adding modes turns it into a law about complete editing sessions. The programs
+and their proofs are written in Lean 4. Along the way, we distinguish equality
+of editor states from correctness of terminal I/O.
+\end{abstract}
+
+\section{Begin by returning}
+
+Our first program is easy to leave.
+\begin{lstlisting}[language=Lean]
+def main : IO Unit := pure ()
+\end{lstlisting}
+It returns without reading a key or displaying a character. We keep it as the
+first of three executables: a program that does nothing, an editor in which
+typing inserts text, and a modal editor in which a letter can instead name a
+command. The useful steps should preserve something of this beginning's
+simplicity.
+
+There are two decisions to make. We need a place at which to edit, and a meaning
+for each key. We shall first settle the place, then give keys one meaning, and
+finally allow a mode to choose between two meanings. Our destination is a law
+for the interaction ``enter insert mode, type some text, return to command
+mode''. Splitting the text across two such interactions will have the same
+final effect as entering it in one.
+
+The representation is the list form of Huet's zipper
+\citep{huet1997}; the style of development owes much to Bird's calculation of a
+Sudoku solver \citep{bird2006}. We use Lean 4 \citep{demoura2021} both to run
+the editor and to check its equations. Familiarity with functional programming
+and lists will suffice for the argument. The few proof scripts we display are
+accompanied by their calculations.
+
+\section{Find a place}
+\label{sec:place}
+
+A document and a natural number would give us text and a cursor, provided the
+number stayed within the document. We could carry a proof of that condition.
+Instead, let the cursor be a cut in the text. Store the part before the cut
+backwards and the part after it forwards:
+\[
+  \texttt{hel\,|\,lo}
+  \qquad\longleftrightarrow\qquad
+  \langle[\texttt{l},\texttt{e},\texttt{h}],
+          [\texttt{l},\texttt{o}]\rangle.
+\]
+The next character in either direction is now at the head of a list.
+\begin{lstlisting}[language=Lean]
+structure Buffer where
+  before : List Char := []
+  after : List Char := []
+\end{lstlisting}
+Every pair of lists is a valid buffer, including the pair of empty lists.
+The focus is a gap: there are $n+1$ possible cursor positions in a document of
+$n$ characters. This convention will remain the same in both modes.
+
+We observe a buffer in two ways:
+\begin{lstlisting}[language=Lean]
+def text (b : Buffer) : List Char := b.before.reverse ++ b.after
+def position (b : Buffer) : Nat := b.before.length
+def ofText (cs : List Char) : Buffer := ⟨[], cs⟩
+\end{lstlisting}
+The functions live in the \code{Buffer} namespace; \code{b.text} abbreviates
+\code{Buffer.text b}. Angle brackets construct a record, and \code{++}
+concatenates lists. We omit surrounding namespaces in the listings.
+
+Write $\txt b$ for the text and $\pos b$ for the position. For
+$b=\langle l,r\rangle$, the definitions give
+\begin{equation}
+  \txt b=\rev l\cat r,\qquad \pos b=|l|\leq|\txt b|.
+  \label{eq:observations}
+\end{equation}
+Taking and dropping at the cursor recovers the two pieces:
+\begin{equation}
+  \take(\pos b,\txt b)=\rev l,
+  \qquad \drop(\pos b,\txt b)=r.
+  \label{eq:recover}
+\end{equation}
+Reversal is its own inverse, so text and position determine the entire buffer.
+This gives an extensionality principle: to specify an edit completely, specify
+its resulting text and position. The representation has neither an out-of-bounds
+cursor nor an unobservable extra field.
+
+Moving the gap transfers a head between the lists.
+\begin{lstlisting}[language=Lean]
+def left : Buffer → Buffer
+  | ⟨[], cs⟩ => ⟨[], cs⟩
+  | ⟨c :: cs, rest⟩ => ⟨cs, c :: rest⟩
+
+def right : Buffer → Buffer
+  | ⟨cs, []⟩ => ⟨cs, []⟩
+  | ⟨cs, c :: rest⟩ => ⟨c :: cs, rest⟩
+\end{lstlisting}
+An impossible move leaves the buffer alone. Both operations preserve $\txt$;
+their positions are respectively $\pos b-1$ and
+$\min(\pos b+1,|\txt b|)$, where subtraction on natural numbers saturates at
+zero. Thus
+\[
+  (b.\code{left}).\code{right}=b\quad\text{if }0<\pos b.
+\]
+The hypothesis is essential. At the beginning of a nonempty document, left
+does nothing and right advances. Total functions have not made the boundary
+disappear; they have made its behaviour explicit.
+
+Now insert a list before the gap, leaving the gap after the new text.
+Backspace and forward delete discard a head on the appropriate side.
+\begin{lstlisting}[language=Lean]
+def insert (b : Buffer) (cs : List Char) : Buffer :=
+  ⟨cs.reverse ++ b.before, b.after⟩
+
+def backspace (b : Buffer) : Buffer := ⟨b.before.tail, b.after⟩
+def delete (b : Buffer) : Buffer := ⟨b.before, b.after.tail⟩
+\end{lstlisting}
+Lean defines the tail of an empty list to be empty. Deletion therefore needs
+no exceptional state. Inserting a character and then backspacing restores the
+original buffer exactly.
+
+The specification of insertion need not mention reversed lists. If $t=\txt b$
+and $p=\pos b$, it is
+\begin{align}
+  \txt(b.\code{insert}\ xs)&=\take(p,t)\cat xs\cat\drop(p,t),
+  \label{eq:insert-text}\\
+  \pos(b.\code{insert}\ xs)&=p+|xs|.
+  \label{eq:insert-position}
+\end{align}
+Substituting~\eqref{eq:recover}, the first equation reduces to
+\[
+  \rev(\rev xs\cat l)\cat r
+    =\rev l\cat xs\cat r.
+\]
+Reverse an append, cancel two reversals, and reassociate. The cursor equation
+uses the lengths of reversal and append. By extensionality, these two
+calculations account for the whole edit. The accompanying code checks them as
+\code{text_insert} and \code{position_insert}; backspace and delete have
+analogous \code{take}/\code{drop} specifications.
+
+\section{Put two insertions together}
+\label{sec:insertion}
+
+Write $b\ins xs$ for \code{b.insert xs}. For
+$b=\langle l,r\rangle$, expanding the definition gives
+\begin{align*}
+ (b\ins xs)\ins ys
+   &=\langle\rev ys\cat(\rev xs\cat l),r\rangle\\
+   &=\langle\rev(xs\cat ys)\cat l,r\rangle\\
+   &=b\ins(xs\cat ys).
+\end{align*}
+The second block is nearer the head of the reversed list, hence later in the
+document. Together with insertion of the empty list, we have our first law.
+
+\begin{law}[Insertion]
+For every buffer $b$ and character lists $xs,ys$,
+\begin{equation}
+ b\ins[]=b,\qquad (b\ins xs)\ins ys=b\ins(xs\cat ys).
+ \label{eq:insertion-action}
+\end{equation}
+\end{law}
+\noindent
+In algebraic language, insertion is a right action of the monoid of lists under
+concatenation. The practical content is that a typing task may be divided into
+pieces without changing its final result. This is a law of whole buffers,
+including their cursor positions.
+
+The concatenation equation takes one simplification in Lean:
+\begin{lstlisting}[language=Lean]
+theorem insert_append (b : Buffer) (xs ys : List Char) :
+    (b.insert xs).insert ys = b.insert (xs ++ ys) := by
+  simp [insert, List.reverse_append, List.append_assoc]
+\end{lstlisting}
+Here \code{simp} unfolds insertion and applies the stated list identities.
+The calculation explains why those identities are sufficient. Later we will
+need exactly this law at a larger scale.
+
+\section{Give the keyboard a meaning}
+\label{sec:direct}
+
+A buffer can be edited, but cannot yet be used. A terminal reader will give us
+values of type \code{Key}: characters, arrows, Enter, Backspace, and the other
+decoded inputs. Each key chooses an action. Most actions transform the state;
+two ask the surrounding program to do something else.
+\begin{lstlisting}[language=Lean]
+inductive Action (State : Type) where
+  | edit (change : State → State)
+  | save | quit
+\end{lstlisting}
+For the moment, \code{State} is \code{Buffer}. Keeping it a parameter will
+cost us nothing now and save us work when modes arrive. The state transformation
+performed by an action is
+\begin{lstlisting}[language=Lean]
+def Action.apply (action : Action State) (s : State) : State :=
+  match action with
+  | .edit change => change s
+  | .save | .quit => s
+\end{lstlisting}
+This function is a projection onto the pure part of an action. The terminal
+loop must also inspect the constructor to carry out a save or quit request.
+Neither request changes the buffer value.
+
+The first interpretation of the keyboard inserts characters and assigns the
+remaining keys their direct editing operations:
+\begin{lstlisting}[language=Lean]
+def Key.action : Key → Action Buffer
+  | .character c => .edit (·.insert [c])
+  | .paste cs => .edit (·.insert cs)
+  | .left => .edit Buffer.left
+  | .right => .edit Buffer.right
+  | .up => .edit Buffer.up
+  | .down => .edit Buffer.down
+  | .home => .edit Buffer.home
+  | .lineEnd => .edit Buffer.lineEnd
+  | .delete => .edit Buffer.delete
+  | .backspace => .edit Buffer.backspace
+  | .enter => .edit (·.insert ['\n'])
+  | .tab => .edit (·.insert ['\t'])
+  | .save => .save
+  | .quit => .quit
+  | .escape | .redraw => .edit id
+\end{lstlisting}
+The section \lstinline[language=Lean]|(·.insert [c])| means
+\code{fun b => b.insert [c]}.
+Line movements are additional buffer functions built from \code{seek}, which
+cuts the text at a requested offset and reconstructs its zipper. Their formulas
+will play no role in the modal extension: any function from \code{Buffer} to
+\code{Buffer} can be bound in the same way.
+
+We can now close a loop: draw the buffer, read a key, choose an action, apply
+its pure part, and handle any request. Ctrl-S denotes save and Ctrl-Q denotes
+quit. Remembering the text after a successful save lets the loop recognize
+unsaved changes. Cursor movement cannot make a clean file dirty, by preservation
+of $\txt$.
+
+This is our second executable, \code{walk-editor}. It opens a file in a terminal,
+accepts typing, moves the cursor, scrolls, and saves. It has one interpretation
+of the keyboard and no need to consult a mode. We have reached an editor before
+designing a command language.
+
+\section{Give the same key another meaning}
+\label{sec:modes}
+
+Suppose \texttt{h} should also mean ``move left''. A function from keys to actions
+cannot choose between that command and insertion of the letter. We need one
+more input to the choice: a mode.
+\begin{lstlisting}[language=Lean]
+inductive Mode where
+  | insert | command
+  deriving DecidableEq, Repr
+
+structure Editor where
+  buffer : Buffer
+  mode : Mode := .command
+\end{lstlisting}
+The buffer is unchanged. We lift its operations to the larger state by changing
+one field and preserving the other:
+\begin{lstlisting}[language=Lean]
+def change (f : Buffer → Buffer) (e : Editor) : Editor :=
+  { e with buffer := f e.buffer }
+def enter (mode : Mode) (e : Editor) : Editor := { e with mode }
+\end{lstlisting}
+These functions live in the \code{Editor} namespace. Record update exposes the
+independence of the two coordinates. In particular,
+\[
+ \code{change}\ g\,(\code{change}\ f\ e)
+   =\code{change}\,(g\circ f)\ e.
+\]
+Lifting buffer operations respects their order of composition. The corresponding
+lifting of actions keeps the two requests intact:
+\begin{lstlisting}[language=Lean]
+def lift : Action Buffer → Action Editor
+  | .edit f => .edit (change f)
+  | .save => .save
+  | .quit => .quit
+\end{lstlisting}
+The useful commuting equation is small enough to prove by inspection:
+\begin{lstlisting}[language=Lean]
+theorem apply_lift (a : Action Buffer) (b : Buffer) (m : Mode) :
+    (lift a).apply ⟨b, m⟩ = ⟨a.apply b, m⟩ := by
+  cases a <;> rfl
+\end{lstlisting}
+Inspect the three constructors of \code{a}; each case reduces to equality of the
+same value. Applying an old action and adjoining the mode agrees with adjoining
+the mode and applying the lifted action. This is the reason the old editor can
+be reused inside the new one.
+
+\Needspace{18\baselineskip}
+Insert mode will use the old interpretation. Command mode supplies a new one:
+\begin{lstlisting}[language=Lean]
+def command : Key → Action Editor
+  | .character 'i' => .edit (enter .insert)
+  | .character 'a' => .edit (enter .insert ∘ change Buffer.right)
+  | .character 'h' => lift (.edit Buffer.left)
+  | .character 'j' => lift (.edit Buffer.down)
+  | .character 'k' => lift (.edit Buffer.up)
+  | .character 'l' => lift (.edit Buffer.right)
+  | .character '0' => lift (.edit Buffer.home)
+  | .character '$' => lift (.edit Buffer.lineEnd)
+  | .character 'x' => lift (.edit Buffer.delete)
+  | .character 'w' => .save
+  | .character 'q' => .quit
+  | .character _ | .paste _ | .enter | .tab | .backspace => .edit id
+  | key => lift key.action
+\end{lstlisting}
+The interesting new actions are \texttt{i}, which changes only the mode, and
+\texttt{a}, which composes a rightward move with that change. Unbound characters
+do nothing. Physical navigation keys retain their old meanings. Finally, the
+mode selects the interpretation, with Escape always returning to command mode:
+\begin{lstlisting}[language=Lean]
+def action (e : Editor) (key : Key) : Action Editor :=
+  match key with
+  | .escape => .edit (enter .command)
+  | _ => match e.mode with
+    | .insert => lift key.action
+    | .command => command key
+\end{lstlisting}
+Escape leaves the gap in place. This convention matters: changing mode preserves
+both text and cursor, and a second Escape has no further effect. It will let us
+state an exact round trip without a cursor correction.
+
+The third executable, \code{lean-editor}, starts in command mode. Press
+\texttt{i}, type \texttt{hello}, and press Escape. Then press \texttt{0},
+\texttt{x}, \texttt{i}, \texttt{H}, Escape, \texttt{w}, and \texttt{q}.
+Starting with an empty file, this saves \texttt{Hello}. Both editors use the
+same terminal loop: the direct editor always lifts \code{Key.action}; the modal
+editor consults \code{Editor.action}. In the shared implementation the direct
+editor's mode field is fixed and ignored by its bindings.
+
+\section{Recover the insertion law}
+\label{sec:session}
+
+We have changed the interface substantially. What remains of the insertion law?
+Define one pure transition, then thread it through a list of keys:
+\begin{lstlisting}[language=Lean]
+def step (e : Editor) (key : Key) : Editor := (e.action key).apply e
+\end{lstlisting}
+\begin{lstlisting}[language=Lean]
+def replay (e : Editor) (keys : List Key) : Editor := keys.foldl step e
+\end{lstlisting}
+Write $\Replay(e,ks)$ for \code{replay e ks}. The equations of a left fold are
+\begin{align}
+ \Replay(e,[]) &= e,\nonumber\\
+ \Replay(e,k::ks) &= \Replay(\code{step}\ e\ k,ks),\nonumber\\
+ \Replay(e,ks\cat ls) &= \Replay(\Replay(e,ks),ls).
+ \label{eq:replay-append}
+\end{align}
+This describes state changes. It does not stop at a quit request or write a file
+at a save request, since \code{Action.apply} projects both to the identity.
+Consequently these equations do not claim equality of complete I/O executions.
+The insert sessions below contain neither request.
+
+We can first state precisely how insert mode reuses the direct editor. Let
+$\Direct(b,ks)$ be the fold that applies \code{key.action.apply} to a buffer for
+each key. For any list $ks$ containing no Escape,
+\begin{equation}
+ \Replay(\langle b,\insertmode\rangle,ks)
+    =\langle\Direct(b,ks),\insertmode\rangle.
+ \label{eq:refinement}
+\end{equation}
+For one key, \code{action} chooses \code{lift key.action}, so \code{apply_lift}
+gives the equality. Induction extends it to a list, using the equation again
+on the updated buffer. Escape is excluded exactly because it changes the mode.
+The checked theorem \code{replay_insert} covers movement, deletion, newlines,
+and pastes as well as ordinary characters; it is a statement about their pure
+states, including the state projections of save and quit.
+
+Now let $\chars(xs)$ map \code{Key.character} over a character list. Typing that
+list in insert mode amounts to bulk insertion:
+\begin{equation}
+ \Replay(\langle b,\insertmode\rangle,\chars(xs))
+    =\langle b\ins xs,\insertmode\rangle.
+ \label{eq:type-text}
+\end{equation}
+For $xs=[]$, this is insertion of the empty list. In the inductive case,
+expose the first character and apply the induction hypothesis:
+\begin{align*}
+ \Replay(\langle b,\insertmode\rangle,\chars(c::cs))
+   &=\Replay(\langle b\ins[c],\insertmode\rangle,\chars(cs))\\
+   &=\langle(b\ins[c])\ins cs,\insertmode\rangle\\
+   &=\langle b\ins(c::cs),\insertmode\rangle.
+\end{align*}
+The last equality is the insertion law. Its use is visible in the Lean proof:
+\begin{lstlisting}[language=Lean]
+theorem type_text (b : Buffer) (cs : List Char) :
+    replay ⟨b, .insert⟩ (cs.map Key.character) =
+      ⟨b.insert cs, .insert⟩ := by
+  induction cs generalizing b with
+  | nil => simp
+  | cons c cs ih =>
+    rw [List.map_cons, replay_cons, step_insert_character, ih]
+    simp [Buffer.insert_append]
+\end{lstlisting}
+The phrase \code{generalizing b} is important: the induction hypothesis must
+apply after insertion of the first character, when the buffer has changed.
+
+Let $\ikey$ denote \code{Key.character 'i'}, let $\esc$ denote \code{Key.escape},
+and package the three parts of an insert session as
+\begin{equation}
+ \Session(xs)=[\ikey]\cat\chars(xs)\cat[\esc].
+ \label{eq:session}
+\end{equation}
+\Needspace{6\baselineskip}
+We can now close the round trip.
+
+\begin{law}[Insert session]
+For every buffer $b$ and character list $xs$,
+\begin{equation}
+ \Replay(\langle b,\cmd\rangle,\Session(xs))
+    =\langle b\ins xs,\cmd\rangle.
+ \label{eq:session-law}
+\end{equation}
+\end{law}
+\begin{proof}
+The first key enters insert mode without changing the buffer.
+Equation~\eqref{eq:type-text} accounts for the character keys. The last key
+returns to command mode without changing the buffer. Splitting the replay at
+these boundaries gives the calculation
+\begin{align*}
+ \Replay(\langle b,\cmd\rangle,\Session(xs))
+   &=\Replay(\langle b,\insertmode\rangle,\chars(xs)\cat[\esc])\\
+   &=\Replay(\langle b\ins xs,\insertmode\rangle,[\esc])\\
+   &=\langle b\ins xs,\cmd\rangle.\qedhere
+\end{align*}
+\end{proof}
+\noindent
+The corresponding proof contains only the rewrites just described:
+\begin{lstlisting}[language=Lean]
+theorem insert_session (b : Buffer) (cs : List Char) :
+    replay ⟨b, .command⟩
+      (.character 'i' :: (cs.map Key.character ++ [.escape])) =
+        ⟨b.insert cs, .command⟩ := by
+  rw [replay_cons, step_command_i, replay_append, type_text,
+    replay_cons, step_escape]
+  rfl
+\end{lstlisting}
+This is equality of the whole editor value. Equations~\eqref{eq:insert-text}
+and~\eqref{eq:insert-position} therefore give the final text and cursor,
+and the theorem supplies the final mode. The statement places no bound on
+the document, its cursor offset, or the inserted list.
+
+There is a small surprise left. The encoding $\Session$ does \emph{not} preserve
+concatenation of character lists as concatenation of key lists:
+$\Session(xs)\cat\Session(ys)$ contains a middle Escape and \texttt{i} that
+$\Session(xs\cat ys)$ lacks. After interpretation from command mode, however,
+those delimiters disappear:
+\begin{align}
+ &\Replay(\langle b,\cmd\rangle,\Session(xs)\cat\Session(ys))\nonumber\\
+ &\quad=\Replay(\langle b\ins xs,\cmd\rangle,\Session(ys))\nonumber\\
+ &\quad=\langle(b\ins xs)\ins ys,\cmd\rangle\nonumber\\
+ &\quad=\langle b\ins(xs\cat ys),\cmd\rangle\nonumber\\
+ &\quad=\Replay(\langle b,\cmd\rangle,\Session(xs\cat ys)).
+ \label{eq:fusion}
+\end{align}
+Equation~\eqref{eq:replay-append}, the session law, and the original insertion
+law are sufficient. The theorem \code{insert_sessions} checks the calculation.
+Insertion of the empty list becomes an empty session that leaves a command-mode
+editor unchanged. Complete insert sessions thus realize the same right action
+as bulk insertion, even though their encodings contain extra keys. They agree
+in final state; their intermediate displays and input histories still differ.
+
+\section{The terminal at the boundary}
+\label{sec:boundary}
+
+The objects in the session law are decoded events. A \code{Key.character} is
+data even when its character is \texttt{q} or \texttt{i}. Physical Enter, Tab,
+and Escape are different constructors. The theorem does not assert that any
+chosen list of raw terminal bytes decodes to \code{chars xs}.
+
+Pasting makes the distinction useful. A bracketed paste arrives as one
+\code{Key.paste} carrying a list, rather than as a list of character commands.
+The mode-specific rules are
+\begin{align*}
+ \code{step}\ \langle b,\insertmode\rangle\ (\code{paste}\ xs)
+   &=\langle b\ins xs,\insertmode\rangle,\\
+ \code{step}\ \langle b,\cmd\rangle\ (\code{paste}\ xs)
+   &=\langle b,\cmd\rangle.
+\end{align*}
+Both are checked by reduction. Thus a decoded paste containing \texttt{xwq}
+is inserted literally or ignored; it cannot delete, save, and quit. The reader
+implements xterm's bracketed-paste convention \citep{xterm} and normalizes
+pasted CRLF and CR line endings to LF. Input without the paste delimiters is
+ordinary keyboard input.
+
+The terminal code also resolves Escape's second role as an escape-sequence
+prefix, decodes UTF-8, draws a scrolling viewport, and restores raw settings
+on normal exit and caught I/O errors. The actual loop applies the same pure
+action as \code{step}. File writes, byte decoding, terminal cleanup, and glyph
+placement are outside the proofs. The library additionally proves seeking,
+text preservation for line movement, and the viewport bounds; it does not
+separately prove the exact row and column chosen by Up and Down.
+
+Costs have a similarly clear boundary. Left, right, backspace, delete, and
+single-character insertion use constant-size list manipulations. Inserting
+$k$ characters takes $O(k)$ such work. Observing text, calculating line motion,
+and redrawing can traverse the document. These are structural cost arguments,
+not formal resource bounds. The complete editor redraws on each key and is
+intended for small files. It assumes one screen cell per character, with tabs
+shown as four spaces; wide glyphs and combining sequences require more work.
+Saving overwrites the target directly. Undo, selection, and search are absent.
+
+The accompanying artifact preserves all three stops:
+\begin{lstlisting}[language={}]
+lake build --wfail
+lake exe walk-empty
+lake exe walk-editor notes.txt
+lake exe lean-editor notes.txt
+\end{lstlisting}
+The terminal programs require \code{stty} and a UTF-8 terminal on macOS or Linux.
+The repository pins Lean 4.34.1 and uses its standard library. Building checks
+the proofs and produces the executables; there are no project-specific axioms
+or \code{sorry} placeholders. The proof terms rely on Lean's trusted logical
+environment. They do not verify its compiler or the operating system.
+
+The buffer definitions are in \code{LeanEditor/Basic.lean}; the two keyboard
+interpretations and interaction proofs are in \code{Keys.lean} and
+\code{Editor.lean} under the same directory. Every Lean listing in this paper
+is checked against the source when building the document. The definitions
+are the ones executed by the editor, with namespace wrappers omitted here.
+
+We started with a program that could only return. A gap gave it a place to
+edit; functions gave its keys meanings; a second coordinate let those meanings
+change. The law that explained two insertions now explains two conversations
+with the editor. The extra interface has preserved the algebra we began with.
+
+\begin{thebibliography}{4}
+\small
+\raggedright
+
+\bibitem[Bird(2006)]{bird2006}
+Bird, R. (2006).
+A program to solve Sudoku.
+\emph{Journal of Functional Programming}, 16(6), 671--679.
+\href{https://doi.org/10.1017/S0956796806006058}{doi:10.1017/S0956796806006058}.
+
+\bibitem[de~Moura and Ullrich(2021)]{demoura2021}
+de~Moura, L. and Ullrich, S. (2021).
+The Lean 4 theorem prover and programming language (system description).
+In \emph{Automated Deduction---CADE 28}, LNCS 12699, 625--635.
+\href{https://doi.org/10.1007/978-3-030-79876-5_37}{doi:10.1007/978-3-030-79876-5\_37}.
+
+\bibitem[Huet(1997)]{huet1997}
+Huet, G. (1997).
+The zipper.
+\emph{Journal of Functional Programming}, 7(5), 549--554.
+\href{https://doi.org/10.1017/S0956796897002864}{doi:10.1017/S0956796897002864}.
+
+\bibitem[Moy et al.(2026)]{xterm}
+Moy, E., revised by Gildea, S. and Dickey, T. (2026).
+\emph{XTerm Control Sequences}. Patch 411, 23 August 2026.
+\url{https://invisible-island.net/xterm/ctlseqs/ctlseqs.html}.
+
+\end{thebibliography}
+\end{document}
